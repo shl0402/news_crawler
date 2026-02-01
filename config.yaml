@@ -1,0 +1,63 @@
+# =============================================================================
+# Financial News Crawler Configuration
+# =============================================================================
+
+# Stock list grouped by category
+stocks:
+  Auto:
+    - code: "1211.HK"
+      name: "BYD"
+  Tech:
+    - code: "0700.HK"
+      name: "Tencent"
+    - code: "9988.HK"
+      name: "Alibaba"
+  Bank:
+    - code: "0005.HK"
+      name: "HSBC"
+  Chips:
+    - code: "0981.HK"
+      name: "SMIC"
+
+# Date range for news search
+date_range:
+  # Number of days to look back from today
+  lookback_days: 180
+
+# Search settings
+search:
+  # Exact number of news articles to fetch per stock
+  results_per_stock: 20
+  # Search language
+  language: "en"
+  # News sources to prioritize (used in search queries)
+  preferred_sources:
+    - "reuters"
+    - "bloomberg"
+    - "scmp"
+    - "hkej"
+
+# Request settings (to avoid getting banned)
+request:
+  # Delay between requests in seconds
+  delay_seconds: 2
+  # Timeout for requests in seconds
+  timeout: 30
+  # User agent for requests
+  user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Output settings
+output:
+  # Output format: "excel", "jsonl", or "both"
+  format: "both"
+  # Output directory
+  directory: "output"
+  # Base filename (without extension)
+  filename: "financial_news_data"
+
+# Logging settings
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: "INFO"
+  # Log file path
+  file: "crawler.log"

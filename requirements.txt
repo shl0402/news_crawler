@@ -1,0 +1,37 @@
+# =============================================================================
+# Financial News Crawler - Dependencies
+# =============================================================================
+
+# Configuration
+PyYAML>=6.0
+
+# News scraping
+newspaper3k>=0.2.8
+lxml>=4.9.0
+lxml_html_clean>=0.1.0
+
+# Stock data
+yfinance>=0.2.36
+
+# Web requests and parsing
+requests>=2.31.0
+beautifulsoup4>=4.12.0
+
+# Google search for finding news
+googlesearch-python>=1.2.3
+
+# Data processing
+pandas>=2.0.0
+
+# Excel output
+openpyxl>=3.1.0
+
+# Date handling
+python-dateutil>=2.8.0
+
+# Retry mechanism
+tenacity>=8.2.0
+
+# LangChain for fast scraping (used in test.py/test2.py)
+langchain-community>=0.2.0
+langchain-text-splitters>=0.2.0
