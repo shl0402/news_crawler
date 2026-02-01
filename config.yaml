@@ -22,12 +22,17 @@ stocks:
 # Date range for news search
 date_range:
   # Number of days to look back from today
-  lookback_days: 180
+  lookback_days: 14
+  # Number of days per search period (default 7 = weekly)
+  # Examples: 7 = weekly, 10 = every 10 days, 14 = bi-weekly, 30 = monthly
+  period_days: 7
 
 # Search settings
 search:
-  # Exact number of news articles to fetch per stock
-  results_per_stock: 20
+  # Number of news articles to fetch per stock PER PERIOD
+  # Total = results_per_period * (lookback_days / period_days)
+  # Example: 2/period * (49 days / 7) = 14 articles per stock
+  results_per_period: 2
   # Search language
   language: "en"
   # News sources to prioritize (used in search queries)
@@ -45,6 +50,15 @@ request:
   timeout: 30
   # User agent for requests
   user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# Scraping settings
+scraping:
+  # Number of parallel Selenium WebDrivers (more = faster but uses more memory)
+  # Recommended: 3-5 for most systems, up to 10 for high-end machines
+  parallel_drivers: 5
+  # Minimum word count for article content (articles below this are skipped)
+  # Set to 350 to ensure quality content
+  min_content_words: 350
 
 # Output settings
 output:
