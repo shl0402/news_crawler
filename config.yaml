@@ -375,6 +375,10 @@ scraping:
   # Minimum word count for article content (articles below this are skipped)
   # Set to 350 to ensure quality content
   min_content_words: 350
+  # Headless mode - set to false for better detection avoidance (v5 only)
+  # false = visible browser window (recommended for Google searches)
+  # true = headless (faster but more likely to be blocked)
+  headless: false
 
 # Output settings
 output:

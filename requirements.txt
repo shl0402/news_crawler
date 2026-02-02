@@ -1,5 +1,5 @@
 # =============================================================================
-# Financial News Crawler v4 - Dependencies
+# Financial News Crawler v5 - Dependencies
 # =============================================================================
 
 # Configuration
@@ -7,6 +7,9 @@ PyYAML>=6.0
 
 # Web scraping with Selenium
 selenium>=4.15.0
+
+# Undetected ChromeDriver - bypasses bot detection (for mainv5.py)
+undetected-chromedriver>=3.5.0
 
 # Data processing
 pandas>=2.0.0
