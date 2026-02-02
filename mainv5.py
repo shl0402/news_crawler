@@ -6,11 +6,17 @@ Production version with UNDETECTED CHROMEDRIVER to bypass Google bot detection.
 
 Features:
 - Uses undetected-chromedriver to avoid CAPTCHA/blocking
+- GRANULAR progress tracking (per stock + period combination)
+- Human-readable progress file (scrape_progress.txt)
 - Graceful shutdown handling (Ctrl+C)
-- Auto-save progress after each stock
+- Auto-save progress after each task
 - Resume capability from progress file
-- Failure report for stocks with insufficient data
-- Crash recovery with incremental saves
+- Clean WebDriver cleanup (fixes WinError 6)
+
+Progress File Format:
+1810.HK|小米集團|Auto|2026-01-26|2026-02-02|2/2|DONE
+1810.HK|小米集團|Auto|2026-01-19|2026-01-26|0/2|PENDING  ← will retry this
+1211.HK|比亞迪股份|Auto|2026-01-26|2026-02-02|1/2|PARTIAL
 
 Install: pip install undetected-chromedriver
 """
@@ -22,8 +28,10 @@ import time
 import random
 import sys
 import signal
+import atexit
+import threading
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
@@ -63,109 +71,182 @@ def setup_logging() -> logging.Logger:
 
 
 # =============================================================================
-# Progress Tracker - Handles resume and incremental saves
+# Progress Tracker - Granular tracking per stock + period
 # =============================================================================
 
 class ProgressTracker:
-    """Tracks progress, enables resume, and handles incremental saves."""
+    """
+    Tracks progress at granular level: each stock + period combination.
     
-    def __init__(self, output_dir: str = "output"):
+    Progress file format (scrape_progress.txt):
+    1810.HK|小米集團|Auto|2026-01-26|2026-02-02|2/2|DONE
+    1810.HK|小米集團|Auto|2026-01-19|2026-01-26|0/2|PENDING
+    1211.HK|比亞迪股份|Auto|2026-01-26|2026-02-02|1/2|PARTIAL
+    ...
+    
+    Status: PENDING, PARTIAL, DONE, BLOCKED, ERROR
+    """
+    
+    def __init__(self, config: Dict, output_dir: str = "output"):
+        self.config = config
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         
-        # Progress file to track what's been scraped
-        self.progress_file = self.output_dir / "crawl_progress.json"
-        # Failure report file
-        self.failure_file = self.output_dir / "crawl_failures.txt"
-        # Current session data file (incremental save)
+        self.progress_file = self.output_dir / "scrape_progress.txt"
+        self.failure_file = self.output_dir / "scrape_failures.txt"
         self.session_file = self.output_dir / "current_session.jsonl"
         
-        self.progress = self._load_progress()
-        self.failures = []
+        self.logger = logging.getLogger('NewsCrawlerV5')
+        
+        # Settings from config
+        self.period_days = config.get('date_range', {}).get('period_days', 7)
+        self.lookback_days = config.get('date_range', {}).get('lookback_days', 14)
+        self.results_per_period = config.get('search', {}).get('results_per_period', 2)
+        self.num_periods = self.lookback_days // self.period_days
+        
+        # Load or initialize progress
+        self.tasks = self._load_or_init_progress()
         self.session_records = []
-        
-    def _load_progress(self) -> Dict:
-        """Load progress from file if exists."""
+    
+    def _load_or_init_progress(self) -> List[Dict]:
+        """Load existing progress or initialize new task list."""
         if self.progress_file.exists():
-            try:
-                with open(self.progress_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            except:
-                pass
-        return {
-            'completed_stocks': [],
-            'blocked_stocks': [],
-            'current_stock': None,
-            'current_period': 0,
-            'total_articles': 0,
-            'last_updated': None,
-            'session_id': datetime.now().strftime('%Y%m%d_%H%M%S')
-        }
+            return self._load_progress()
+        else:
+            return self._init_progress()
     
-    def save_progress(self):
-        """Save progress to file."""
-        self.progress['last_updated'] = datetime.now().isoformat()
-        with open(self.progress_file, 'w', encoding='utf-8') as f:
-            json.dump(self.progress, f, indent=2)
-    
-    def is_stock_completed(self, stock_code: str) -> bool:
-        """Check if a stock has been fully scraped."""
-        return stock_code in self.progress.get('completed_stocks', [])
-    
-    def is_stock_blocked(self, stock_code: str) -> bool:
-        """Check if a stock was marked as blocked."""
-        return stock_code in self.progress.get('blocked_stocks', [])
-    
-    def mark_stock_started(self, stock_code: str):
-        """Mark a stock as currently being processed."""
-        self.progress['current_stock'] = stock_code
-        self.progress['current_period'] = 0
-        self.save_progress()
-    
-    def mark_period_completed(self, stock_code: str, period_num: int):
-        """Mark a period as completed."""
-        self.progress['current_period'] = period_num
-        self.save_progress()
-    
-    def mark_stock_completed(self, stock_code: str, article_count: int):
-        """Mark a stock as fully scraped."""
-        if stock_code not in self.progress['completed_stocks']:
-            self.progress['completed_stocks'].append(stock_code)
-        # Remove from blocked list if it was there
-        if stock_code in self.progress.get('blocked_stocks', []):
-            self.progress['blocked_stocks'].remove(stock_code)
-        self.progress['current_stock'] = None
-        self.progress['current_period'] = 0
-        self.progress['total_articles'] += article_count
-        self.save_progress()
-    
-    def mark_stock_blocked(self, stock_code: str):
-        """Mark a stock as possibly blocked (will retry on next run)."""
-        if 'blocked_stocks' not in self.progress:
-            self.progress['blocked_stocks'] = []
-        if stock_code not in self.progress['blocked_stocks']:
-            self.progress['blocked_stocks'].append(stock_code)
-        self.progress['current_stock'] = None
-        self.progress['current_period'] = 0
-        self.save_progress()
-    
-    def add_failure(self, stock_code: str, stock_name: str, expected: int, actual: int, details: str = ""):
-        """Record a failure (stock didn't get enough articles)."""
-        failure = {
-            'timestamp': datetime.now().isoformat(),
-            'stock_code': stock_code,
-            'stock_name': stock_name,
-            'expected_articles': expected,
-            'actual_articles': actual,
-            'details': details
-        }
-        self.failures.append(failure)
+    def _init_progress(self) -> List[Dict]:
+        """Initialize all tasks based on config."""
+        tasks = []
+        today = datetime.now()
+        stocks = self.config.get('stocks', {})
         
-        with open(self.failure_file, 'a', encoding='utf-8') as f:
-            f.write(f"[{failure['timestamp']}] {stock_code} ({stock_name}): Got {actual}/{expected} articles. {details}\n")
+        self.logger.info("Initializing progress tracker (first run)...")
+        
+        for category, stock_list in stocks.items():
+            for stock in stock_list:
+                stock_code = stock['code']
+                stock_name = stock['name']
+                
+                # Create tasks from most recent to oldest period
+                for period_num in range(1, self.num_periods + 1):
+                    period_end = today - timedelta(days=(period_num - 1) * self.period_days)
+                    period_start = period_end - timedelta(days=self.period_days)
+                    
+                    task = {
+                        'stock_code': stock_code,
+                        'stock_name': stock_name,
+                        'category': category,
+                        'period_start': period_start.strftime('%Y-%m-%d'),
+                        'period_end': period_end.strftime('%Y-%m-%d'),
+                        'target': self.results_per_period,
+                        'scraped': 0,
+                        'status': 'PENDING'  # PENDING, PARTIAL, DONE, BLOCKED, ERROR
+                    }
+                    tasks.append(task)
+        
+        self._save_progress(tasks)
+        
+        # Count unique stocks
+        unique_stocks = len(set(t['stock_code'] for t in tasks))
+        self.logger.info(f"Initialized {len(tasks)} tasks ({unique_stocks} stocks x {self.num_periods} periods)")
+        return tasks
+    
+    def _load_progress(self) -> List[Dict]:
+        """Load progress from file."""
+        tasks = []
+        try:
+            with open(self.progress_file, 'r', encoding='utf-8') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    parts = line.split('|')
+                    if len(parts) >= 7:
+                        scraped_target = parts[5].split('/')
+                        task = {
+                            'stock_code': parts[0],
+                            'stock_name': parts[1],
+                            'category': parts[2],
+                            'period_start': parts[3],
+                            'period_end': parts[4],
+                            'scraped': int(scraped_target[0]),
+                            'target': int(scraped_target[1]),
+                            'status': parts[6]
+                        }
+                        tasks.append(task)
+            
+            self.logger.info(f"Loaded {len(tasks)} tasks from progress file")
+            
+            # Count status
+            done = sum(1 for t in tasks if t['status'] == 'DONE')
+            pending = sum(1 for t in tasks if t['status'] == 'PENDING')
+            partial = sum(1 for t in tasks if t['status'] == 'PARTIAL')
+            blocked = sum(1 for t in tasks if t['status'] == 'BLOCKED')
+            error = sum(1 for t in tasks if t['status'] == 'ERROR')
+            
+            self.logger.info(f"  Status: DONE={done}, PENDING={pending}, PARTIAL={partial}, BLOCKED={blocked}, ERROR={error}")
+            
+        except Exception as e:
+            self.logger.error(f"Error loading progress: {e}")
+            tasks = self._init_progress()
+        
+        return tasks
+    
+    def _save_progress(self, tasks: List[Dict] = None):
+        """Save progress to file."""
+        if tasks is None:
+            tasks = self.tasks
+        
+        with open(self.progress_file, 'w', encoding='utf-8') as f:
+            f.write("# Stock Scraping Progress - DO NOT EDIT MANUALLY\n")
+            f.write(f"# Generated: {datetime.now().isoformat()}\n")
+            f.write("# Format: stock_code|stock_name|category|period_start|period_end|scraped/target|status\n")
+            f.write("# Status: PENDING=not started, PARTIAL=incomplete, DONE=complete, BLOCKED=Google blocked, ERROR=scrape error\n")
+            f.write("#\n")
+            
+            for task in tasks:
+                line = f"{task['stock_code']}|{task['stock_name']}|{task['category']}|"
+                line += f"{task['period_start']}|{task['period_end']}|"
+                line += f"{task['scraped']}/{task['target']}|{task['status']}\n"
+                f.write(line)
+    
+    def get_next_task(self) -> Optional[Dict]:
+        """Get next task that needs work (from top to bottom, never skip)."""
+        for task in self.tasks:
+            # Check tasks in order - DONE tasks are skipped, everything else needs work
+            if task['status'] != 'DONE':
+                return task
+        return None
+    
+    def update_task(self, stock_code: str, period_start: str, scraped: int, status: str):
+        """Update a specific task's progress."""
+        for task in self.tasks:
+            if task['stock_code'] == stock_code and task['period_start'] == period_start:
+                task['scraped'] = scraped
+                task['status'] = status
+                self._save_progress()
+                return
+    
+    def mark_task_done(self, stock_code: str, period_start: str, scraped: int):
+        """Mark a task as completed."""
+        self.update_task(stock_code, period_start, scraped, 'DONE')
+    
+    def mark_task_partial(self, stock_code: str, period_start: str, scraped: int):
+        """Mark a task as partially completed."""
+        self.update_task(stock_code, period_start, scraped, 'PARTIAL')
+    
+    def mark_task_blocked(self, stock_code: str, period_start: str, scraped: int = 0):
+        """Mark a task as blocked by Google."""
+        self.update_task(stock_code, period_start, scraped, 'BLOCKED')
+    
+    def mark_task_error(self, stock_code: str, period_start: str, scraped: int = 0):
+        """Mark a task as error."""
+        self.update_task(stock_code, period_start, scraped, 'ERROR')
     
     def add_record(self, record: Dict):
-        """Add a record and save incrementally."""
+        """Add a record and save incrementally to session file."""
         self.session_records.append(record)
         
         with open(self.session_file, 'a', encoding='utf-8') as f:
@@ -174,44 +255,85 @@ class ProgressTracker:
                 if isinstance(v, (datetime, pd.Timestamp)):
                     clean_record[k] = v.isoformat() if v else None
                 elif isinstance(v, list):
-                    clean_record[k] = '|'.join(v) if v else ''
+                    clean_record[k] = '|'.join(str(x) for x in v) if v else ''
                 else:
                     clean_record[k] = v
             f.write(json.dumps(clean_record, ensure_ascii=False) + '\n')
     
-    def save_stock_checkpoint(self, stock_code: str, stock_name: str, records: List[Dict], base_filename: str):
-        """Save checkpoint after completing a stock."""
+    def add_failure(self, stock_code: str, stock_name: str, period: str, reason: str):
+        """Record a failure."""
+        with open(self.failure_file, 'a', encoding='utf-8') as f:
+            timestamp = datetime.now().isoformat()
+            f.write(f"[{timestamp}] {stock_code} ({stock_name}) - {period}: {reason}\n")
+    
+    def save_checkpoint(self, stock_code: str, stock_name: str, records: List[Dict]) -> Optional[Path]:
+        """Save checkpoint file for current scraping batch."""
         if not records:
-            return
+            return None
         
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         clean_name = ''.join(c for c in stock_name if c.isalnum() or c in ' -_').strip().replace(' ', '_')
-        stock_file = self.output_dir / f"checkpoint_{stock_code.replace('.', '_')}_{clean_name}_{timestamp}.xlsx"
+        checkpoint_file = self.output_dir / f"checkpoint_{stock_code.replace('.', '_')}_{clean_name}_{timestamp}.xlsx"
         
         try:
             df = pd.DataFrame(records)
             for col in df.columns:
-                df[col] = df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) else x)
+                df[col] = df[col].apply(lambda x: '|'.join(str(i) for i in x) if isinstance(x, list) else x)
                 try:
                     df[col] = df[col].apply(lambda x: x.replace(tzinfo=None) if hasattr(x, 'tzinfo') and x.tzinfo else x)
                 except:
                     pass
             
-            df.to_excel(stock_file, index=False, engine='openpyxl')
-            return stock_file
+            df.to_excel(checkpoint_file, index=False, engine='openpyxl')
+            return checkpoint_file
         except Exception as e:
+            self.logger.error(f"Error saving checkpoint: {e}")
             return None
     
     def get_summary(self) -> str:
         """Get progress summary."""
-        return f"Completed stocks: {len(self.progress.get('completed_stocks', []))}\nTotal articles: {self.progress.get('total_articles', 0)}\nFailures: {len(self.failures)}"
+        total = len(self.tasks)
+        done = sum(1 for t in self.tasks if t['status'] == 'DONE')
+        pending = sum(1 for t in self.tasks if t['status'] == 'PENDING')
+        partial = sum(1 for t in self.tasks if t['status'] == 'PARTIAL')
+        blocked = sum(1 for t in self.tasks if t['status'] == 'BLOCKED')
+        error = sum(1 for t in self.tasks if t['status'] == 'ERROR')
+        
+        total_scraped = sum(t['scraped'] for t in self.tasks)
+        total_target = sum(t['target'] for t in self.tasks)
+        
+        pct = (done / total * 100) if total > 0 else 0
+        art_pct = (total_scraped / total_target * 100) if total_target > 0 else 0
+        
+        return (f"Tasks: {done}/{total} done ({pct:.1f}%)\n"
+                f"  DONE={done}, PENDING={pending}, PARTIAL={partial}, BLOCKED={blocked}, ERROR={error}\n"
+                f"  Articles: {total_scraped}/{total_target} ({art_pct:.1f}%)")
     
-    def clear_progress(self):
-        """Clear progress file after successful completion."""
+    def is_all_done(self) -> bool:
+        """Check if all tasks are completed."""
+        return all(t['status'] == 'DONE' for t in self.tasks)
+    
+    def reset_blocked_and_errors(self):
+        """Reset BLOCKED and ERROR tasks to allow retry."""
+        count = 0
+        for task in self.tasks:
+            if task['status'] in ['BLOCKED', 'ERROR']:
+                task['status'] = 'PENDING' if task['scraped'] == 0 else 'PARTIAL'
+                count += 1
+        
+        if count > 0:
+            self._save_progress()
+            self.logger.info(f"Reset {count} BLOCKED/ERROR tasks for retry")
+        return count
+    
+    def delete_progress_file(self):
+        """Delete progress files after successful completion."""
         if self.progress_file.exists():
             self.progress_file.unlink()
+            self.logger.info(f"Deleted: {self.progress_file}")
         if self.session_file.exists():
             self.session_file.unlink()
+            self.logger.info(f"Deleted: {self.session_file}")
 
 
 # =============================================================================
@@ -239,7 +361,7 @@ class DataSaver:
         
         # Clean data
         for col in df.columns:
-            df[col] = df[col].apply(lambda x: '|'.join(x) if isinstance(x, list) else x)
+            df[col] = df[col].apply(lambda x: '|'.join(str(i) for i in x) if isinstance(x, list) else x)
             try:
                 df[col] = df[col].apply(lambda x: x.replace(tzinfo=None) if hasattr(x, 'tzinfo') and x.tzinfo else x)
             except:
@@ -252,7 +374,7 @@ class DataSaver:
             excel_path = self.output_dir / f"{self.base_filename}.xlsx"
             self.logger.info(f"  Saving Excel file...")
             df.to_excel(excel_path, index=False, engine='openpyxl')
-            self.logger.info(f"Excel saved: {excel_path}")
+            self.logger.info(f"  ✓ Excel saved: {excel_path}")
         
         if output_format in ['jsonl', 'both']:
             jsonl_path = self.output_dir / f"{self.base_filename}.jsonl"
@@ -260,15 +382,19 @@ class DataSaver:
             with open(jsonl_path, 'w', encoding='utf-8') as f:
                 for _, row in df.iterrows():
                     f.write(json.dumps(row.to_dict(), ensure_ascii=False, default=str) + '\n')
-            self.logger.info(f"JSONL saved: {jsonl_path}")
+            self.logger.info(f"  ✓ JSONL saved: {jsonl_path}")
         
-        self.logger.info("✓ All files saved successfully!")
         return excel_path, jsonl_path
 
 
 # =============================================================================
 # Robust Crawler with Undetected ChromeDriver
 # =============================================================================
+
+# Global shutdown event for clean interrupts
+_shutdown_event = threading.Event()
+_shutdown_count = 0
+
 
 class RobustCrawler:
     """
@@ -281,44 +407,55 @@ class RobustCrawler:
         self.logger = logging.getLogger('NewsCrawlerV5')
         
         # Settings
-        self.period_days = config.get('scraping', {}).get('period_days', 7)
-        self.results_per_period = config.get('scraping', {}).get('results_per_period', 2)
-        lookback_days = config.get('scraping', {}).get('lookback_days', 14)
-        self.num_periods = lookback_days // self.period_days
         self.min_words = config.get('scraping', {}).get('min_content_words', 500)
-        self.target_per_stock = self.results_per_period * self.num_periods
-        
-        # Headless mode setting
         self.headless = config.get('scraping', {}).get('headless', False)
+        self.chrome_version = config.get('scraping', {}).get('chrome_version', None)
         
-        # Shutdown flag
-        self.shutdown_requested = False
-        self._shutdown_count = 0
-        
-        # Driver
+        # Driver state
         self.driver = None
+        self._driver_active = False
+        
+        # Setup driver
         self._setup_driver()
         
         # Setup signal handler for graceful shutdown
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+        
+        # Register cleanup on exit (prevents WinError 6)
+        atexit.register(self._safe_cleanup)
+    
+    @property
+    def shutdown_requested(self) -> bool:
+        """Check if shutdown was requested."""
+        return _shutdown_event.is_set()
     
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
-        self._shutdown_count += 1
+        global _shutdown_count
+        _shutdown_count += 1
         
-        if self._shutdown_count == 1:
-            self.logger.warning("\n⚠️  Shutdown requested! Finishing current operation and saving...")
-            self.logger.warning("    Press Ctrl+C again to force exit immediately.")
-            self.shutdown_requested = True
+        if _shutdown_count == 1:
+            print("\n" + "="*50, flush=True)
+            print("⚠️  SHUTDOWN REQUESTED - saving progress...", flush=True)
+            print("    Press Ctrl+C again to force exit.", flush=True)
+            print("="*50, flush=True)
+            _shutdown_event.set()
         else:
-            self.logger.warning("\n🛑 Force exit requested! Exiting immediately...")
+            print("\n🛑 FORCE EXIT!", flush=True)
+            self._safe_cleanup()
+            os._exit(1)  # Hard exit
+    
+    def _safe_cleanup(self):
+        """Safely cleanup resources (prevents WinError 6)."""
+        if self._driver_active and self.driver:
             try:
-                if self.driver:
-                    self.driver.quit()
-            except:
-                pass
-            sys.exit(1)
+                self._driver_active = False  # Prevent double cleanup
+                self.driver.quit()
+            except Exception:
+                pass  # Ignore all errors during cleanup
+            finally:
+                self.driver = None
     
     def _setup_driver(self):
         """Setup Undetected ChromeDriver - bypasses bot detection."""
@@ -326,196 +463,151 @@ class RobustCrawler:
         
         options = uc.ChromeOptions()
         
-        # Headless mode (v2 for undetected-chromedriver)
         if self.headless:
             options.add_argument('--headless=new')
             self.logger.info("  Mode: Headless")
         else:
-            self.logger.info("  Mode: Visible browser (better for avoiding detection)")
+            self.logger.info("  Mode: Visible browser (recommended)")
         
         options.add_argument('--no-sandbox')
         options.add_argument('--disable-dev-shm-usage')
         options.add_argument('--window-size=1920,1080')
         options.add_argument('--disable-blink-features=AutomationControlled')
         
-        # Use undetected_chromedriver
-        self.driver = uc.Chrome(options=options, use_subprocess=True)
+        # Chrome version
+        if self.chrome_version:
+            self.logger.info(f"  Chrome version: {self.chrome_version}")
+            self.driver = uc.Chrome(options=options, use_subprocess=True, version_main=self.chrome_version)
+        else:
+            self.driver = uc.Chrome(options=options, use_subprocess=True)
+        
+        self._driver_active = True
         self.driver.set_page_load_timeout(30)
         
-        # Add some human-like behavior
-        self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        try:
+            self.driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        except:
+            pass
         
         self.logger.info("✓ Undetected ChromeDriver ready")
     
-    def crawl_stock(self, stock_code: str, stock_name: str, category: str) -> tuple:
-        """Crawl news for a single stock with progress tracking."""
-        self.logger.info(f"  Target: {self.target_per_stock} articles ({self.results_per_period}/period x {self.num_periods} periods)")
+    def crawl_task(self, task: Dict) -> Tuple[List[Dict], int, str]:
+        """
+        Crawl a single task (one stock + one period).
+        Returns: (records, new_scraped_count, final_status)
+        """
+        stock_code = task['stock_code']
+        stock_name = task['stock_name']
+        category = task['category']
+        period_start = datetime.strptime(task['period_start'], '%Y-%m-%d')
+        period_end = datetime.strptime(task['period_end'], '%Y-%m-%d')
+        target = task['target']
+        already_scraped = task['scraped']
         
-        self.tracker.mark_stock_started(stock_code)
+        self.logger.info(f"  Period: {task['period_start']} → {task['period_end']}")
+        self.logger.info(f"  Need: {target - already_scraped} more articles (have {already_scraped}/{target})")
         
-        all_records = []
-        today = datetime.now()
+        # Search for URLs
+        date_min = period_start.strftime("%m/%d/%Y")
+        date_max = period_end.strftime("%m/%d/%Y")
+        
+        urls, possibly_blocked = self._search_google(stock_code, stock_name, date_min, date_max)
+        self.logger.info(f"    Found {len(urls)} candidate URLs")
+        sys.stdout.flush()
+        
+        # Check for blocking
+        if possibly_blocked and not urls:
+            self.logger.warning(f"    ⚠️ Possibly blocked by Google - will retry later")
+            self.tracker.add_failure(stock_code, stock_name, 
+                                     f"{task['period_start']} to {task['period_end']}", 
+                                     "Blocked by Google")
+            return [], 0, 'BLOCKED'
+        
+        # No URLs but not blocked = genuinely no results for this period
+        if not urls:
+            self.logger.info(f"    No URLs found for this period")
+            return [], 0, 'DONE'
+        
+        # Scrape articles
+        records = []
         seen_titles = set()
-        possibly_blocked = False
+        needed = target - already_scraped
         
-        for period_num in range(1, self.num_periods + 1):
+        for url in urls:
             if self.shutdown_requested:
-                self.logger.warning(f"  Shutdown requested, stopping at period {period_num}")
                 break
             
-            period_end = today - timedelta(days=(period_num - 1) * self.period_days)
-            period_start = period_end - timedelta(days=self.period_days)
+            if len(records) >= needed:
+                break
             
-            date_min = period_start.strftime("%m/%d/%Y")
-            date_max = period_end.strftime("%m/%d/%Y")
-            
-            self.logger.info(f"  Period {period_num}/{self.num_periods}: {period_start.strftime('%Y-%m-%d')} to {period_end.strftime('%Y-%m-%d')}")
+            self.logger.info(f"    Scraping: {url[:70]}...")
             sys.stdout.flush()
             
-            urls, period_blocked = self._search_google(stock_code, stock_name, date_min, date_max)
-            self.logger.info(f"    Found {len(urls)} candidate URLs")
-            sys.stdout.flush()
+            article, fail_reason = self._scrape_article(url, period_start, period_end)
             
-            if period_blocked:
-                possibly_blocked = True
-            
-            if not urls:
-                if period_blocked:
-                    self.logger.warning(f"    ⚠️ No URLs found for period {period_num} (possibly blocked by Google)")
-                else:
-                    self.logger.warning(f"    No URLs found for period {period_num}")
-                self.tracker.mark_period_completed(stock_code, period_num)
-                continue
-            
-            period_articles = []
-            url_index = 0
-            
-            while len(period_articles) < self.results_per_period and url_index < len(urls):
-                if self.shutdown_requested:
-                    break
+            if article:
+                title_normalized = article['title'].lower().strip()
+                if title_normalized in seen_titles:
+                    self.logger.info(f"      ✗ Duplicate title")
+                    continue
                 
-                url = urls[url_index]
-                url_index += 1
+                seen_titles.add(title_normalized)
                 
-                self.logger.info(f"    Scraping: {url[:80]}...")
+                record = {
+                    'Stock_Code': stock_code,
+                    'Stock_Name': stock_name,
+                    'Category': category,
+                    'News_Date': article.get('publish_date'),
+                    'News_Date_Formatted': self._format_timezone(article.get('publish_date')),
+                    'Period_Start': task['period_start'],
+                    'Period_End': task['period_end'],
+                    'News_Title': article.get('title', '')[:500],
+                    'News_Source': article.get('source', 'UNKNOWN'),
+                    'News_Content': article.get('content', '')[:5000],
+                    'Content_Length': article.get('content_length', 0),
+                    'Word_Count': article.get('word_count', 0),
+                    'Image_URLs': article.get('images', []),
+                    'News_URL': article.get('url', ''),
+                    'Scrape_Time_Sec': article.get('scrape_time', 0)
+                }
+                
+                records.append(record)
+                self.tracker.add_record(record)
+                
+                self.logger.info(f"      ✓ [{already_scraped + len(records)}/{target}] {article['title'][:50]}... ({article['word_count']} words)")
                 sys.stdout.flush()
-                
-                article, fail_reason = self._scrape_article(url, period_num, period_start, period_end)
-                
-                if article:
-                    title_normalized = article['title'].lower().strip()
-                    if title_normalized in seen_titles:
-                        self.logger.info(f"      ✗ Duplicate title")
-                        continue
-                    
-                    seen_titles.add(title_normalized)
-                    period_articles.append(article)
-                    
-                    record = {
-                        'Stock_Code': stock_code,
-                        'Stock_Name': stock_name,
-                        'Category': category,
-                        'News_Date': article.get('publish_date'),
-                        'News_Date_Formatted': self._format_timezone(article.get('publish_date')),
-                        'Period_Num': period_num,
-                        'News_Title': article.get('title', '')[:500],
-                        'News_Source': article.get('source', 'UNKNOWN'),
-                        'News_Content': article.get('content', '')[:5000],
-                        'Content_Length': article.get('content_length', 0),
-                        'Word_Count': article.get('word_count', 0),
-                        'Image_URLs': article.get('images', []),
-                        'News_URL': article.get('url', ''),
-                        'Scrape_Time_Sec': article.get('scrape_time', 0)
-                    }
-                    
-                    all_records.append(record)
-                    self.tracker.add_record(record)
-                    
-                    self.logger.info(f"      ✓ [{len(period_articles)}/{self.results_per_period}] {article['title'][:50]}... ({article['word_count']} words)")
-                    sys.stdout.flush()
-                else:
-                    self.logger.info(f"      ✗ {fail_reason}")
-                    sys.stdout.flush()
-            
-            if len(period_articles) < self.results_per_period:
-                self.logger.warning(f"    ⚠ Period {period_num}: {len(period_articles)}/{self.results_per_period} articles")
             else:
-                self.logger.info(f"    ✓ Period {period_num}: {len(period_articles)}/{self.results_per_period} articles")
-            
-            self.tracker.mark_period_completed(stock_code, period_num)
-            time.sleep(random.uniform(1, 2))  # Random delay between periods
+                self.logger.info(f"      ✗ {fail_reason}")
+                sys.stdout.flush()
         
-        # Check if we were interrupted
+        # Determine final status
+        total_scraped = already_scraped + len(records)
+        
         if self.shutdown_requested:
-            self.logger.info(f"  ⚠️ Interrupted with {len(all_records)} articles collected (will retry on resume)")
-            return all_records, len(all_records), False
-        
-        real_article_count = len(all_records)
-        
-        if not all_records:
-            if possibly_blocked:
-                placeholder = {
-                    'Stock_Code': stock_code,
-                    'Stock_Name': stock_name,
-                    'Category': category,
-                    'News_Date': None,
-                    'News_Date_Formatted': 'Possibly blocked - retry later',
-                    'Period_Num': 0,
-                    'News_Title': 'POSSIBLY_BLOCKED',
-                    'News_Source': 'N/A',
-                    'News_Content': f'Google may have blocked requests for {stock_name} ({stock_code}). Will retry on next run.',
-                    'Content_Length': 0,
-                    'Word_Count': 0,
-                    'Image_URLs': [],
-                    'News_URL': '',
-                    'Scrape_Time_Sec': 0
-                }
-                self.logger.warning(f"  ⚠️ Possibly blocked for {stock_name} - will retry on next run")
-                self.tracker.mark_stock_blocked(stock_code)
-            else:
-                placeholder = {
-                    'Stock_Code': stock_code,
-                    'Stock_Name': stock_name,
-                    'Category': category,
-                    'News_Date': None,
-                    'News_Date_Formatted': 'No articles found',
-                    'Period_Num': 0,
-                    'News_Title': 'NO_ARTICLES_FOUND',
-                    'News_Source': 'N/A',
-                    'News_Content': f'No valid articles found for {stock_name} ({stock_code})',
-                    'Content_Length': 0,
-                    'Word_Count': 0,
-                    'Image_URLs': [],
-                    'News_URL': '',
-                    'Scrape_Time_Sec': 0
-                }
-                self.logger.info(f"  ❌ No articles found for {stock_name} - placeholder added")
-            all_records.append(placeholder)
-            self.tracker.add_record(placeholder)
+            # Interrupted - save partial progress
+            status = 'PARTIAL' if total_scraped > 0 else 'PENDING'
+        elif total_scraped >= target:
+            status = 'DONE'
+        elif total_scraped > 0:
+            status = 'PARTIAL'
+        elif possibly_blocked:
+            status = 'BLOCKED'
         else:
-            self.logger.info(f"  ✅ Total: {real_article_count}/{self.target_per_stock} articles for {stock_name}")
+            # Tried but found nothing valid = treat as done for this period
+            status = 'DONE'
         
-        if real_article_count < self.target_per_stock and not possibly_blocked:
-            self.tracker.add_failure(
-                stock_code, stock_name, 
-                self.target_per_stock, real_article_count,
-                f"Found {real_article_count} articles (need {self.target_per_stock})"
-            )
-        
-        was_actually_blocked = (real_article_count == 0) and possibly_blocked
-        
-        return all_records, real_article_count, was_actually_blocked
+        return records, len(records), status
     
-    def _search_google(self, stock_code: str, stock_name: str, date_min: str, date_max: str) -> tuple:
+    def _search_google(self, stock_code: str, stock_name: str, date_min: str, date_max: str) -> Tuple[List[str], bool]:
         """Search Google with date range. Returns (urls, possibly_blocked)."""
         urls = []
         possibly_blocked = False
         date_filter = f"cdr:1,cd_min:{date_min},cd_max:{date_max}"
         
         queries = [
-            f"{stock_name} {stock_code} yfinance",
             f"{stock_name} {stock_code} stock news",
             f"{stock_name} {stock_code} financial news",
+            f"{stock_code} news",
         ]
         
         for query_idx, query in enumerate(queries):
@@ -524,20 +616,18 @@ class RobustCrawler:
             
             try:
                 search_url = f"https://www.google.com/search?q={quote(query)}&tbs={quote(date_filter)}&hl=en"
-                self.logger.info(f"    Search: {search_url[:100]}...")
-                sys.stdout.flush()
                 
                 self.driver.get(search_url)
+                self._interruptible_sleep(random.uniform(2, 4))  # Human-like delay
                 
-                # Random human-like delay
-                time.sleep(random.uniform(2, 4))
-                
+                # Check for blocking
                 page_source = self.driver.page_source.lower()
                 if 'captcha' in page_source or 'unusual traffic' in page_source:
                     self.logger.warning("    ⚠️ Google blocking detected...")
                     possibly_blocked = True
-                    time.sleep(random.uniform(5, 10))
+                    self._interruptible_sleep(random.uniform(5, 10))
                 
+                # Extract URLs
                 seen = set()
                 selectors = ['div.g a[href]', 'div.yuRUbf a', 'h3 a', 'a[data-ved]', 'a[href*="http"]']
                 
@@ -552,19 +642,21 @@ class RobustCrawler:
                     except:
                         continue
                 
-                # If no results, try with different query
-                if not urls and query_idx < len(queries) - 1:
-                    time.sleep(random.uniform(1, 2))
-                    continue
-                
                 if urls:
-                    break
+                    break  # Found URLs, stop trying queries
+                
+                if query_idx < len(queries) - 1:
+                    self._interruptible_sleep(random.uniform(1, 2))
                     
             except Exception as e:
                 self.logger.debug(f"Search error: {e}")
                 continue
         
         return urls[:30], possibly_blocked
+    
+    def _interruptible_sleep(self, seconds: float):
+        """Sleep that can be interrupted by shutdown signal."""
+        _shutdown_event.wait(timeout=seconds)
     
     def _is_valid_news_url(self, url: str) -> bool:
         if not url or not url.startswith('http'):
@@ -580,7 +672,7 @@ class RobustCrawler:
         url_lower = url.lower()
         return not any(ex in url_lower for ex in excluded)
     
-    def _scrape_article(self, url: str, period_num: int, period_start: datetime, period_end: datetime) -> tuple:
+    def _scrape_article(self, url: str, period_start: datetime, period_end: datetime) -> Tuple[Optional[Dict], Optional[str]]:
         """Scrape a single article."""
         if self.shutdown_requested:
             return None, "Shutdown requested"
@@ -599,7 +691,7 @@ class RobustCrawler:
             except:
                 return None, "Timeout"
             
-            time.sleep(random.uniform(1, 2))
+            self._interruptible_sleep(random.uniform(1, 2))
             
             content = self._extract_content()
             if not content:
@@ -701,6 +793,7 @@ class RobustCrawler:
             except:
                 continue
         
+        # Default to middle of period
         return period_start + (period_end - period_start) / 2
     
     def _extract_images(self) -> List[str]:
@@ -728,12 +821,8 @@ class RobustCrawler:
             return str(dt)
     
     def close(self):
-        """Close the WebDriver."""
-        if self.driver:
-            try:
-                self.driver.quit()
-            except:
-                pass
+        """Close the WebDriver safely."""
+        self._safe_cleanup()
 
 
 # =============================================================================
@@ -745,173 +834,150 @@ def main():
     
     logger.info("=" * 60)
     logger.info("Financial News Crawler v5 (UNDETECTED CHROME)")
-    logger.info("With bot-detection bypass for Google searches")
+    logger.info("Granular progress tracking (per stock + period)")
     logger.info("=" * 60)
     
     config = load_config()
     
-    period_days = config.get('scraping', {}).get('period_days', 7)
-    results_per_period = config.get('scraping', {}).get('results_per_period', 2)
-    lookback_days = config.get('scraping', {}).get('lookback_days', 14)
+    # Display settings
+    period_days = config.get('date_range', {}).get('period_days', 7)
+    results_per_period = config.get('search', {}).get('results_per_period', 2)
+    lookback_days = config.get('date_range', {}).get('lookback_days', 14)
     num_periods = lookback_days // period_days
-    target_per_stock = results_per_period * num_periods
     min_words = config.get('scraping', {}).get('min_content_words', 500)
     headless = config.get('scraping', {}).get('headless', False)
     
-    logger.info(f"Settings: {results_per_period}/period x {num_periods} periods ({period_days} days) = {target_per_stock}/stock")
-    logger.info(f"Min words: {min_words}")
-    logger.info(f"Headless mode: {headless}")
+    logger.info(f"Settings:")
+    logger.info(f"  Lookback: {lookback_days} days, Period: {period_days} days = {num_periods} periods")
+    logger.info(f"  Articles per period: {results_per_period}")
+    logger.info(f"  Min words: {min_words}")
+    logger.info(f"  Headless: {headless}")
     logger.info("Press Ctrl+C to stop gracefully")
     logger.info("=" * 60)
     
-    tracker = ProgressTracker()
+    # Initialize components
+    tracker = ProgressTracker(config)
     saver = DataSaver()
     crawler = RobustCrawler(config, tracker)
     
+    # Handle --reset flag
+    if '--reset' in sys.argv:
+        reset_count = tracker.reset_blocked_and_errors()
+        if reset_count == 0:
+            logger.info("No BLOCKED/ERROR tasks to reset")
+    
     total_start = time.time()
-    
-    if tracker.progress.get('completed_stocks'):
-        logger.info(f"Resuming from previous session...")
-        logger.info(f"Already completed: {len(tracker.progress['completed_stocks'])} stocks")
-    if tracker.progress.get('blocked_stocks'):
-        logger.info(f"Blocked stocks (will retry): {len(tracker.progress['blocked_stocks'])} stocks")
-    
-    stocks = config.get('stocks', {})
-    output_format = config.get('output', {}).get('format', 'both')
-    
     all_records = []
-    stocks_processed = 0
-    stocks_skipped = 0
-    stocks_blocked = 0
+    tasks_done = 0
+    tasks_blocked = 0
+    current_stock = None
+    stock_records = []
+    
+    logger.info(f"\n{tracker.get_summary()}")
+    logger.info("")
     
     try:
-        for category, stock_list in stocks.items():
+        while True:
             if crawler.shutdown_requested:
                 break
             
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Category: {category}")
-            logger.info(f"{'='*60}")
+            # Get next task
+            task = tracker.get_next_task()
+            if task is None:
+                logger.info("\n✅ All tasks completed!")
+                break
             
-            for stock in stock_list:
-                if crawler.shutdown_requested:
-                    break
+            # Log stock change
+            if task['stock_code'] != current_stock:
+                # Save checkpoint for previous stock
+                if current_stock and stock_records:
+                    checkpoint = tracker.save_checkpoint(current_stock, stock_records[0]['Stock_Name'], stock_records)
+                    if checkpoint:
+                        logger.info(f"  Checkpoint saved: {checkpoint.name}")
                 
-                stock_code = stock['code']
-                stock_name = stock['name']
-                
-                if tracker.is_stock_completed(stock_code):
-                    logger.info(f"\n--- Skipping: {stock_name} ({stock_code}) [Already completed] ---")
-                    stocks_skipped += 1
-                    continue
-                
-                if tracker.is_stock_blocked(stock_code):
-                    logger.info(f"\n--- Retrying: {stock_name} ({stock_code}) [Was blocked before] ---")
-                else:
-                    logger.info(f"\n--- Processing: {stock_name} ({stock_code}) ---")
-                
-                stock_records, real_count, was_blocked = crawler.crawl_stock(stock_code, stock_name, category)
-                all_records.extend(stock_records)
-                
-                if crawler.shutdown_requested:
-                    if stock_records:
-                        checkpoint_file = tracker.save_stock_checkpoint(stock_code, stock_name, stock_records, saver.base_filename)
-                        logger.info(f"  Stock file saved: {checkpoint_file}")
-                    logger.info(f"  ⚠️ Stock interrupted - will retry on next run")
-                    break
-                
-                if stock_records:
-                    checkpoint_file = tracker.save_stock_checkpoint(stock_code, stock_name, stock_records, saver.base_filename)
-                    logger.info(f"  Stock file saved: {checkpoint_file}")
-                
-                if was_blocked:
-                    stocks_blocked += 1
-                    logger.info(f"  Progress: {stocks_blocked} stocks blocked (will retry)")
-                elif real_count > 0:
-                    tracker.mark_stock_completed(stock_code, real_count)
-                    stocks_processed += 1
-                    total_real_articles = sum(1 for r in all_records if r.get('News_Title') not in ['NO_ARTICLES_FOUND', 'POSSIBLY_BLOCKED'])
-                    logger.info(f"  Progress: {stocks_processed} stocks with articles, {total_real_articles} real articles")
-                else:
-                    tracker.mark_stock_completed(stock_code, 0)
-                    stocks_no_articles = sum(1 for r in all_records if r.get('News_Title') == 'NO_ARTICLES_FOUND')
-                    logger.info(f"  Progress: {stocks_no_articles} stocks with no articles found")
+                current_stock = task['stock_code']
+                stock_records = []
+                logger.info(f"\n{'='*50}")
+                logger.info(f"Stock: {task['stock_name']} ({task['stock_code']}) [{task['category']}]")
+                logger.info(f"{'='*50}")
+            
+            # Crawl the task
+            records, new_count, status = crawler.crawl_task(task)
+            all_records.extend(records)
+            stock_records.extend(records)
+            
+            # Update progress
+            total_scraped = task['scraped'] + new_count
+            tracker.update_task(task['stock_code'], task['period_start'], total_scraped, status)
+            
+            # Log result
+            if status == 'DONE':
+                tasks_done += 1
+                logger.info(f"    ✅ DONE: {total_scraped}/{task['target']} articles")
+            elif status == 'BLOCKED':
+                tasks_blocked += 1
+                logger.warning(f"    ⚠️ BLOCKED - will retry")
+            elif status == 'PARTIAL':
+                logger.warning(f"    ⚠ PARTIAL: {total_scraped}/{task['target']} articles")
+            elif status == 'ERROR':
+                logger.error(f"    ❌ ERROR: {total_scraped}/{task['target']} articles")
+            
+            # Small delay between tasks
+            if not crawler.shutdown_requested:
+                _shutdown_event.wait(timeout=random.uniform(0.5, 1.5))
     
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        logger.info("Saving progress before exit...")
+        import traceback
+        traceback.print_exc()
     
     finally:
-        logger.info("Closing WebDriver...")
+        # Save last stock checkpoint
+        if current_stock and stock_records:
+            checkpoint = tracker.save_checkpoint(current_stock, stock_records[0]['Stock_Name'], stock_records)
+            if checkpoint:
+                logger.info(f"  Checkpoint saved: {checkpoint.name}")
+        
+        logger.info("\nClosing WebDriver...")
         crawler.close()
         logger.info("WebDriver closed.")
     
     total_elapsed = time.time() - total_start
     
+    # Final save
     logger.info("\n" + "=" * 60)
     if crawler.shutdown_requested:
-        logger.info("⚠️  Shutdown requested - saving all collected data...")
+        logger.info("⚠️  Session interrupted - progress saved")
     else:
-        logger.info("Pipeline complete!")
+        logger.info("Pipeline finished!")
     logger.info("=" * 60)
     
-    logger.info("Saving progress tracker...")
-    tracker.save_progress()
-    logger.info(f"  Progress saved to: {tracker.progress_file}")
-    
+    # Save final results
+    output_format = config.get('output', {}).get('format', 'both')
     if all_records:
         excel_path, jsonl_path = saver.save(all_records, output_format)
     else:
-        logger.info("No records collected in this session.")
+        logger.info("No new records collected in this session.")
     
     # Summary
-    real_articles = [r for r in all_records if r.get('News_Title') not in ['NO_ARTICLES_FOUND', 'POSSIBLY_BLOCKED']]
-    no_articles_count = sum(1 for r in all_records if r.get('News_Title') == 'NO_ARTICLES_FOUND')
-    blocked_count = sum(1 for r in all_records if r.get('News_Title') == 'POSSIBLY_BLOCKED')
-    
     print("\n" + "=" * 60)
-    print("CRAWLER v5 SUMMARY (Undetected Chrome)")
+    print("CRAWLER v5 SUMMARY")
     print("=" * 60)
-    print(f"Real articles collected: {len(real_articles)}")
-    print(f"Stocks with articles: {stocks_processed}")
-    print(f"Stocks with NO articles: {no_articles_count}")
-    print(f"Stocks BLOCKED (will retry): {blocked_count}")
-    print(f"Stocks skipped (already done): {stocks_skipped}")
-    print(f"Total time: {total_elapsed:.1f} seconds")
-    print(f"\nProgress tracker summary:")
-    print(tracker.get_summary())
-    
-    if tracker.failures:
-        print(f"\n⚠️  FAILURES ({len(tracker.failures)} stocks with insufficient data):")
-        for f in tracker.failures:
-            print(f"  - {f['stock_code']} ({f['stock_name']}): {f['actual_articles']}/{f['expected_articles']}")
-        print(f"\nSee details in: {tracker.failure_file}")
-    
-    if real_articles:
-        df = pd.DataFrame(real_articles)
-        if 'Word_Count' in df.columns:
-            valid_wc = df[df['Word_Count'] > 0]['Word_Count']
-            if len(valid_wc) > 0:
-                print(f"\nContent Quality (valid articles only):")
-                print(f"  Average word count: {int(valid_wc.mean())} words")
-                print(f"  Min word count: {int(valid_wc.min())} words")
-                print(f"  Max word count: {int(valid_wc.max())} words")
-        
-        if 'Stock_Code' in df.columns:
-            print(f"\nArticles per Stock:")
-            for code in df['Stock_Code'].unique():
-                count = len(df[df['Stock_Code'] == code])
-                status = "✓" if count >= target_per_stock else "✗"
-                print(f"  {code}: {count}/{target_per_stock} {status}")
-    
+    print(f"Session articles: {len(all_records)}")
+    print(f"Tasks done this session: {tasks_done}")
+    print(f"Tasks blocked: {tasks_blocked}")
+    print(f"Total time: {total_elapsed:.1f} seconds ({total_elapsed/60:.1f} minutes)")
+    print(f"\n{tracker.get_summary()}")
     print("=" * 60)
     
-    if not crawler.shutdown_requested and not tracker.progress.get('blocked_stocks'):
-        tracker.clear_progress()
-        print("\n✓ Session completed successfully. Progress cleared.")
+    if tracker.is_all_done():
+        print("\n✅ ALL TASKS COMPLETED!")
+        print(f"   You can delete the progress file if you want to start fresh.")
+        print(f"   Progress file: {tracker.progress_file}")
     else:
-        print("\n⚠️  Session interrupted or has blocked stocks. Resume by running again.")
-        print(f"Progress saved in: {tracker.progress_file}")
+        print("\n⚠️  Some tasks incomplete. Run again to continue.")
+        print(f"   Progress file: {tracker.progress_file}")
+        print("\n   To retry BLOCKED/ERROR tasks: python mainv5.py --reset")
 
 
 if __name__ == '__main__':
